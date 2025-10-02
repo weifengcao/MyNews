@@ -1,129 +1,117 @@
 # MyNews - System Design
 
-This document outlines the architecture for the MyNews Personalized News Aggregation and Delivery System.
+This document outlines the architecture for the **MyNews Personalized News Aggregation and Delivery System**.
 
-## 1. Core Goal and Parallel Paths 🎯
+## 1. Core Goal & System Principles
 
-The system is designed around two highly decoupled, parallel paths to handle continuous data processing and personalized user delivery:
+The system's primary goal is to deliver personalized news digests to users based on their subscriptions. It is designed with two highly decoupled, parallel paths to ensure scalability and resilience:
 
-| Path                      | Primary Function                           | Data Flow                            | Key Operations                               |
-| ------------------------- | ------------------------------------------ | ------------------------------------ | -------------------------------------------- |
-| **Path 1: Ingestion & Enrichment** | Continuous Data Processing (The Write Path) | `Ingest → Clean → Categorize → Store`  | CREATE news records.                         |
-| **Path 2: Subscription & Delivery**  | Personalized User Service (The Read Path)   | `Schedule → Filter → Aggregate → Deliver` | READ subscriptions, READ news, UPDATE delivery status. |
+- **Path 1: Ingestion & Enrichment (The "Write Path")**: Continuously ingests, cleans, categorizes, and stores news articles. This path is optimized for high-throughput data processing.
+- **Path 2: Subscription & Delivery (The "Read Path")**: Delivers personalized news digests to users based on their subscriptions. This path is optimized for reliable, scheduled, and real-time delivery.
 
-### High-Level Architecture Diagram
+## 2. High-Level Architecture
 
-```
-                               +-----------------+
-                               |   News Sources  |
-                               +-------+---------+
-                                       |
-                                       v
- PATH 1: INGESTION & ENRICHMENT ------ | ------------------------------------------------
-                                       |
-                                       v
-                            +--------------------+
-                            | Ingestion Service  |
-                            +----------+---------+
-                                       | (Produces to Kafka)
-                                       v
-                         +-----------------------------+
-                         | KAFKA TOPIC: raw_news_topic |
-                         +-----------------------------+
-                                       | (Consumed by)
-                                       v
-                           +-----------------------+
-                           |  Enrichment Service   |
-                           | - NLP, Categorization |
-                           +-----------+-----------+
-                                       |           \ (Produces to Kafka)
-      (Stores in DB)                   |            \
-             v                         v             v
- +-----------------------+  +-------------------------+
- | Elasticsearch         |  | KAFKA TOPIC:            |
- | (News Store)          |  | cleaned_news_topic      |
- +-----------------------+  +-------------------------+
-                                       |
-                                       |
- PATH 2: SUBSCRIPTION & DELIVERY ----- | ------------------------------------------------
-                                       |
-             +-------------------------+-------------------------+
-             | (Real-Time Path)                                (Batch Path)
-             v                                                 v
-  +--------------------+                             +---------------------+
-  |    Alert Service   |                             |  Scheduler Service  |
-  | - Checks breaking  |                             | - Reads Subscriptions|
-  +---------+----------+                             +----------+----------+
-            |                                                    | (Produces to Kafka)
-            |                                                    v
-            |                                      +-----------------------------+
-            |                                      | KAFKA TOPIC: digest_tasks_topic |
-            |                                      +-----------------------------+
-            |                                                    | (Consumed by)
-            |                                                    v
-            |                                      +-----------------------+
-            |                                      |  Aggregation Service  |
-            |                                      | - Queries ES & PG     |
-            |                                      +-----------+-----------+
-            |                                                    |
-            +---------------------+------------------------------+
-                                  | (Produces to Kafka)
-                                  v
-                    +-----------------------------+
-                    | KAFKA TOPIC: delivery_queue |
-                    +-----------------------------+
-                                  | (Consumed by)
-                                  v
-                    +-----------------------------+
-                    |      Delivery Service       |
-                    | - Sends Email/Push          |
-                    +-----------------------------+
+The following diagram illustrates the high-level architecture of the MyNews system.
+
+```mermaid
+graph TD
+    subgraph "Path 1: Ingestion & Enrichment"
+        A[/"News Sources"/] --> B(Ingestion Service);
+        B -- "Raw News (Kafka)" --> C{raw_news_topic};
+        C --> D[Enrichment Service];
+        D -- "Enriched News (Kafka)" --> E{cleaned_news_topic};
+        D -- "Store Article" --> F[(Elasticsearch
+News Store)];
+    end
+
+    subgraph "Path 2: Subscription & Delivery"
+        G[(PostgreSQL
+Subscription Store)] --> H(Scheduler Service);
+        H -- "Digest Tasks (Kafka)" --> I{digest_tasks_topic};
+        I --> J[Aggregation Service];
+        J -- "Read Subscriptions" --> G;
+        J -- "Query Articles" --> F;
+        E -- "Real-time Alerts" --> K[Alert Service];
+        K -- "Read Subscriptions" --> G;
+        J -- "Formatted Digests (Kafka)" --> L{delivery_queue};
+        K -- "Breaking News (Kafka)" --> L;
+        L --> M[Delivery Service];
+    end
+
+    style F fill:#f9f,stroke:#333,stroke-width:2px
+    style G fill:#f9f,stroke:#333,stroke-width:2px
 ```
 
-## 2. Key Technologies and Their Roles 🛠️
+## 3. Key Technologies
 
-| Component        | Technology                  | Role in System                                                     | Why It's Used                                                              |
-| ---------------- | --------------------------- | ------------------------------------------------------------------ | -------------------------------------------------------------------------- |
-| **Message Broker**   | Kafka Cluster               | The central nervous system for asynchronous communication.         | Handles high-volume, continuous data streams and scheduling tasks.         |
-| **Subscription Store** | PostgreSQL (Relational/SQL) | Stores user profiles and structured subscription preferences.      | Guarantees strong consistency for critical user data.                      |
-| **News Store**       | Elasticsearch (NoSQL)       | Stores all enriched news articles with tags.                       | Optimized for fast, complex queries essential for aggregation.             |
+| Component          | Technology      | Role in System                                           | Rationale                                                    |
+| ------------------ | --------------- | -------------------------------------------------------- | ------------------------------------------------------------ |
+| **Message Broker** | Kafka Cluster   | Asynchronous communication between services.             | Handles high-volume data streams and decouples services.     |
+| **Subscription Store** | PostgreSQL      | Stores user profiles and subscription preferences.       | Ensures strong consistency (ACID) for critical user data.    |
+| **News Store**     | Elasticsearch   | Stores enriched and indexed news articles.               | Optimized for fast, complex full-text search and aggregation. |
 
-## 3. Core Data Models 💾
+## 4. Data Models
 
-*   **Subscription** (Stored in PostgreSQL)
-    *   `user_id`, `selected_topics`, `selected_sources`, `delivery_schedule`, `breaking_news_enabled`
-    *   **Purpose**: Defines the filtering criteria for delivery.
+### Subscription (PostgreSQL)
 
-*   **NewsArticle** (Stored in Elasticsearch)
-    *   `article_id`, `title`, `source`, `published_at`, `category_tags`, `is_breaking_news`
-    *   **Purpose**: The object being filtered. The tags are the filterable metadata.
+- `user_id`: Unique identifier for the user.
+- `selected_topics`: List of topics the user is interested in.
+- `selected_sources`: List of news sources the user follows.
+- `delivery_schedule`: Cron expression for digest delivery.
+- `breaking_news_enabled`: Boolean flag for real-time alerts.
 
-*   **DigestTask** (Kafka Message)
-    *   `subscription_id`, `time_window_start`, `priority`
-    *   **Purpose**: The trigger to start the aggregation process.
+### NewsArticle (Elasticsearch)
 
-## 4. The Ingestion Pipeline (Path 1)
+- `article_id`: Unique identifier for the article.
+- `title`: The headline of the article.
+- `source`: The news source (e.g., "BBC News").
+- `published_at`: Timestamp of when the article was published.
+- `category_tags`: List of tags generated by the Enrichment Service.
+- `is_breaking_news`: Boolean flag for important news.
 
-1.  **Ingestion Service**: Fetches raw data (e.g., from an RSS feed).
-2.  **Produce Raw**: Publishes the raw article to Kafka: `raw_news_topic`.
-3.  **Enrichment Service (Consumer)**: Reads from `raw_news_topic`.
-4.  **Categorization**: Uses NLP to add `category_tags` and flags `is_breaking_news`.
-5.  **Store Enriched**: Creates the final, searchable document in Elasticsearch.
-6.  **Produce Cleaned**: Publishes the article ID to Kafka: `cleaned_news_topic` (for the Real-Time Alert Service).
+### Kafka Messages
 
-## 5. The Delivery Pipeline (Path 2)
+- **`DigestTask`**: `(subscription_id, time_window_start, priority)` - Triggers the aggregation process for a user.
+- **`Delivery`**: `(user_id, content, delivery_channel)` - Represents a formatted digest ready for delivery.
 
-### A. Scheduled Digest Path (Batch)
+## 5. Service Breakdown
 
-1.  **Scheduler Service**: Reads the subscriptions table (PostgreSQL) periodically.
-2.  **Produce Task**: Publishes a `DigestTask` message to Kafka: `digest_tasks_topic` for every user who is due.
-3.  **Aggregation Service (Consumer)**: Reads from `digest_tasks_topic`.
-4.  **Filtering/Aggregation**: Reads the user's filters from PostgreSQL, executes a complex READ query against Elasticsearch.
-5.  **Delivery Staging**: Publishes the final formatted digest to Kafka: `delivery_queue_topic`.
-6.  **Delivery Service**: Sends the email/push notification and UPDATES the `last_digest_sent_at` timestamp in PostgreSQL.
+### Ingestion & Enrichment Path
 
-### B. Breaking News Path (Real-Time)
+1.  **Ingestion Service**: Fetches raw data from news sources (e.g., RSS feeds) and produces it to the `raw_news_topic`.
+2.  **Enrichment Service**: Consumes from `raw_news_topic`, performs NLP for categorization and breaking news detection, stores the enriched article in Elasticsearch, and produces the article ID to the `cleaned_news_topic`.
 
-1.  **Alert Service (Consumer)**: Reads continuously from `cleaned_news_topic`.
-2.  **In-Memory Match**: Instantly checks the article's tags against users who have `breaking_news_enabled = true`.
-3.  **Immediate Delivery**: Publishes the alert directly to Kafka: `delivery_queue_topic` with a high priority.
+### Subscription & Delivery Path
+
+#### A. Scheduled Digest (Batch)
+
+1.  **Scheduler Service**: Periodically queries the PostgreSQL database for subscriptions due for a digest. For each, it produces a `DigestTask` to the `digest_tasks_topic`.
+2.  **Aggregation Service**: Consumes `DigestTask` messages. It fetches the user's subscription details from PostgreSQL and queries Elasticsearch for matching articles.
+3.  **Delivery Staging**: The Aggregation Service formats the digest and produces it to the `delivery_queue`.
+4.  **Delivery Service**: Consumes from the `delivery_queue` and sends the digest to the user via email or push notification.
+
+#### B. Breaking News (Real-Time)
+
+1.  **Alert Service**: Consumes from the `cleaned_news_topic` in real-time.
+2.  **In-Memory Match**: Checks the article's tags against an in-memory cache of users who have enabled breaking news alerts.
+3.  **Immediate Delivery**: For each matching user, it produces a high-priority delivery message to the `delivery_queue`.
+
+## 6. Security Considerations
+
+- **Authentication & Authorization**: All API endpoints will be protected by an authentication layer (e.g., OAuth 2.0) to ensure that only authenticated users can access their subscriptions.
+- **Data Encryption**: All data, both in transit (TLS) and at rest (database encryption), will be encrypted to protect user information.
+- **Input Validation**: All services will validate and sanitize input to prevent common vulnerabilities such as SQL injection and cross-site scripting (XSS).
+
+## 7. Monitoring & Observability
+
+- **Structured Logging**: All services will log in a structured format (e.g., JSON) for easier parsing and analysis.
+- **Metrics**: Each service will expose key metrics (e.g., processing latency, error rates, queue depths) via a Prometheus endpoint.
+- **Distributed Tracing**: Implement OpenTelemetry for tracing requests as they flow through the system, allowing for performance bottleneck analysis.
+
+## 8. Scalability & Future Improvements
+
+- **Stateless Services**: All services are designed to be stateless, allowing for horizontal scaling by simply adding more container instances.
+- **Kafka Partitions**: Kafka topics can be partitioned to increase parallelism and throughput.
+- **Database Read Replicas**: For the Subscription Store, read replicas can be added to handle increased load from the Scheduler and Aggregation services.
+- **Future: A/B Testing**: The decoupled design allows for experimenting with different enrichment algorithms or delivery channels by deploying new services that consume from the same Kafka topics.
+- **Future: Machine Learning**: The collected data can be used to train machine learning models for more advanced content recommendation and personalization.
